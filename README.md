@@ -1,4 +1,4 @@
-# [GUIDA] Sbloccare SSH e SP Domain Nascosto su Zyxel EX5601-T1 (Odido) tramite Decifratura API
+# Sbloccare SSH e SP Domain Nascosto su Zyxel EX5601-T1 (Odido) tramite Decifratura API
 
 Se possiedi un router Zyxel EX5601-T1 (noto come T-56) fornito dal tuo ISP (come Odido) e stai cercando di abilitare l'SSH, avrai probabilmente letto guide online che dicono di andare su **Maintenance -> SP Domain** e aggiungere la tua LAN locale alla lista **SP Trust Domain**.
 
