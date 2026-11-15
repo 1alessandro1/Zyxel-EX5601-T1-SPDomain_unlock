@@ -1,0 +1,175 @@
+# [TUTORIAL] How to Unlock SSH & Hidden SP Domain on Zyxel EX5601-T1 (Odido) via API Decryption
+
+If you have a Zyxel EX5601-T1 (T-56) provided by your ISP (like Odido) and you are trying to enable SSH, you have probably read online guides telling you to go to **Maintenance -> SP Domain** and add your local LAN to the **SP Trust Domain** list. 
+
+However, on newer custom firmwares, **this menu is completely hidden**. 
+
+In this guide, I will explain exactly why you can't see it, how the router's internal API hides the data using AES encryption, and how we successfully bypassed the hidden GUI to inject our local LAN IP into the Trust Domain, successfully gaining root/admin SSH access.
+
+---
+
+## ⚠️ Important Note on Firmware V5.70(ACEA.0)T56C_b10_0410
+
+This specific problem—where the **SP Domain** menu is entirely hidden from the GUI and SSH access is blocked—is a direct result of the restrictions implemented in firmware **`V5.70(ACEA.0)T56C_b10_0410`** (distributed by Odido). 
+
+While older firmware versions or generic Zyxel firmwares might have allowed you to simply navigate to *Maintenance -> SP Domain* to configure remote access, in the **`b10_0410`** build, the ISP deliberately:
+1. **Masked the UI:** The `SPDomain` page code is still physically present inside the `app.js` bundle, but it is dynamically hidden from the navigation menu based on account privilege levels.
+2. **Hardcoded a Remote Subnet:** The router's internal `sp_trust_domain` parameter was set to `10.1.3.0/24` by default. This means the router only expected SSH connections from the ISP's internal management network, actively refusing any connection attempt originating from your standard `192.168.1.x` local home network.
+
+Because rolling back the firmware isn't always possible (or breaks ISP compatibility), the API decryption method explained below is the only way to bypass the **`b10_0410`** restrictions and inject your local IP into the Trust Domain without needing the missing GUI button.
+
+---
+
+## 🔐 Understanding Zyxel's API & AES Encryption
+
+You might think: *"If the page is hidden, I'll just send a direct POST request to the router's API!"* 
+If you try to monitor the network traffic or query the endpoint (`/cgi-bin/DAL?oid=sp_trust_domain`), you won't see plain text JSON. You will get something like this:
+
+```json
+{
+  "content": "qvnJSmwSOoCnjVbYlruzo6TzXS+yU5VYfReN7BMj7...",
+  "iv": "pA785wOCrV5qjjiSrg4mF7NumQNgN8FjP8tDovKviqU="
+}
+```
+
+**Here is how Zyxel secured it:**
+1. **AES-CBC Encryption:** All communication between the Web GUI and the CGI backend is encrypted using **AES (Advanced Encryption Standard)** in CBC mode with PKCS7 padding.
+2. **Dynamic Keys:** The encryption key (`AesKey`) is generated dynamically upon your successful login and saved locally in your browser's `localStorage`.
+3. **Initialization Vector (IV):** Every request includes a Base64 encoded `iv` to ensure cryptographic uniqueness.
+4. **CSRF Token:** The router also expects a valid `zySessionKey` in the HTTP headers.
+
+To modify the hidden Trust Domain, we have to manually encrypt our new configuration using the router's exact AES parameters and inject it via the browser console.
+
+---
+
+## 🛠️ The Step-by-Step Solution
+
+Here is how you can manipulate the API using your browser's Developer Tools to add your LAN to the Trust Domain.
+
+### Step 1: Log in to the Router
+Log in normally to your router's web interface (usually `http://192.168.1.1`). Keep the page open.
+
+### Step 2: Read the Current (Hidden) Trust Domain
+Press **F12** to open the Developer Tools, go to the **Console** tab, and run the following script. This script fetches the encrypted data from the hidden `sp_trust_domain` endpoint and decrypts it using the AES key stored in your browser.
+
+*(Note: Depending on the browser, you might need to type "allow pasting" before it lets you paste code).*
+
+```javascript
+// Fetch the AES Key from your current session
+var aesKey = localStorage.getItem("AesKey");
+
+$.ajax({
+    url: "/cgi-bin/DAL?oid=sp_trust_domain",
+    method: "GET",
+    success: function(response) {
+        var parsedIv = CryptoJS.enc.Base64.parse(response.iv);
+        var parsedKey = CryptoJS.enc.Base64.parse(aesKey);
+        
+        // Decrypt the AES payload
+        var decrypted = CryptoJS.AES.decrypt(response.content, parsedKey, {
+            iv: parsedIv,
+            mode: CryptoJS.mode.CBC,
+            padding: CryptoJS.pad.Pkcs7
+        }).toString(CryptoJS.enc.Utf8);
+        
+        console.log("Current Trust Domain Config:", JSON.parse(decrypted));
+    }
+});
+```
+*When we ran this, we discovered the router was expecting connections from `10.1.3.0/24`!*
+
+### Step 3: Inject the New Trust Domain
+Now, we need to overwrite that `10.x` subnet with our local network (`192.168.1.0/24`). Paste the following code into the console and hit Enter. It will encrypt the new JSON payload and push it to the router.
+
+```javascript
+// 1. Define our new Trusted LAN subnet
+var nuovoOggetto = {
+    "Index": 1,
+    "IPAddressPrefix": "192.168.1.0/24" // Change this if your router uses a different subnet (e.g., 192.168.0.0/24)
+};
+
+// 2. Prepare Encryption Keys and IV
+var key = localStorage.getItem("AesKey");
+var ivBytes = CryptoJS.lib.WordArray.random(32).toString(CryptoJS.enc.Base64);
+var ivParsed = CryptoJS.enc.Base64.parse(ivBytes);
+var keyParsed = CryptoJS.enc.Base64.parse(key);
+
+// 3. Encrypt the payload using AES-CBC
+var payloadString = JSON.stringify(nuovoOggetto);
+var encrypted = CryptoJS.AES.encrypt(payloadString, keyParsed, {
+    iv: ivParsed,
+    mode: CryptoJS.mode.CBC,
+    padding: CryptoJS.pad.Pkcs7
+}).toString();
+
+// 4. Send the encrypted POST request to the router
+$.ajax({
+    method: "POST", 
+    url: "/cgi-bin/DAL?oid=sp_trust_domain",
+    dataType: "json",
+    contentType: "application/json",
+    headers: {
+        "CSRFToken": localStorage.getItem("zySessionKey")
+    },
+    data: JSON.stringify({
+        content: encrypted,
+        iv: ivBytes
+    }),
+    success: function(response) {
+        console.log("Response from router:", response);
+    },
+    error: function(err) {
+        console.error("Error during injection:", err);
+    }
+});
+```
+
+If successful, the console will output an encrypted response. Decrypting that response will yield:
+`{ result: "ZCFG_SUCCESS" }`
+
+---
+
+## 🎯 The Final Result
+
+Once you receive the success message, the router immediately accepts SSH connections from your local LAN. 
+
+Open your terminal (Linux/macOS) or PuTTY (Windows) and connect:
+`ssh admin@192.168.1.1`
+
+Enter your admin password, and you are in! Here is the actual terminal dump proving the successful access on the Odido EX5601-T1:
+
+```text
+└╼ale$ssh admin@192.168.1.1
+admin@192.168.1.1's password: 
+ZySH> sys atsh
+Firmware Version          : V5.70(ACEA.0)T56C_b10_0410
+Bootbase Version          : V3.2 | 03/07/2025 11:51:27
+Vendor Name               : ZYXEL Communication Corp
+Product Model             : EX5601-T1
+Serial Number             : S240Y28010085
+First MAC Address         : 909F2204D58B
+Last MAC Address          : 909F2204D595
+MAC Address Quantity      : 11
+Default Country Code      : 00
+Boot Module Debug Flag    : 00
+Kernel Checksum           : 00003BC7
+RootFS Checksum           : 0000535E
+Romfile Checksum          : 0000E73A
+Main Feature Bits         : 00
+Other Feature Bits        : 
+c2f7f0e2: 040a000b ffffffff 00000000 00000000
+c2f7f0f2: ffffffff ffffffff ffffffff
+ZySH> sys atwz 909F2204D58B 0 1
+MAC address  : 90:9F:22:04:D5:8B
+Country Code : 00
+FeatureBit   : 6F
+MAC Number   : AC
+ZySH> sys atck
+supervisor password: FUErjam8LH
+admin password     : QHB8A4D8
+WiFi PSK key       : KLMQV3XRLHB68SYB
+ZySH> 
+```
+
+**Enjoy your unlocked router!** 
+By using the browser's native `CryptoJS` library, we completely bypassed the GUI limitations, interfaced with Zyxel's AES-encrypted CGI backend, and unlocked the local SSH daemon that was hidden behind a restrictive `10.x` Trust Domain.
